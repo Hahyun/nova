@@ -18,7 +18,6 @@
 from __future__ import absolute_import
 
 import copy
-import inspect
 import itertools
 import random
 import sys
@@ -80,6 +79,8 @@ CONF = cfg.CONF
 CONF.register_opts(glance_opts, 'glance')
 CONF.import_opt('auth_strategy', 'nova.api.auth')
 CONF.import_opt('my_ip', 'nova.netconf')
+LOCATION_PREFIX = 'file://'
+DIRECT_MOUNTPOINT = '/glance_images/images/'
 
 
 def generate_glance_url():
@@ -228,12 +229,7 @@ class GlanceClientWrapper(object):
             client = self.client or self._create_onetime_client(context,
                                                                 version)
             try:
-                result = getattr(client.images, method)(*args, **kwargs)
-                if inspect.isgenerator(result):
-                    # Convert generator results to a list, so that we can
-                    # catch any potential exceptions now and retry the call.
-                    return list(result)
-                return result
+                return getattr(client.images, method)(*args, **kwargs)
             except retry_excs as e:
                 host = self.host
                 port = self.port
@@ -403,13 +399,39 @@ class GlanceImageService(object):
     def update(self, context, image_id, image_meta, data=None,
             purge_props=True):
         """Modify the given image with the new data."""
+	def _read_in_chunks(fileObj, chunk_size=10*1024*1024):
+	    while True:
+		data = fileObj.read(chunk_size)
+		if not data:
+		    break
+		yield data
+	
+	#import rpdb;rpdb.set_trace()
         image_meta = _translate_to_glance(image_meta)
         image_meta['purge_props'] = purge_props
+	file_path = DIRECT_MOUNTPOINT + image_id
+        image_meta['location'] = LOCATION_PREFIX + file_path
+
         # NOTE(bcwaldon): id is not an editable field, but it is likely to be
         # passed in by calling code. Let's be nice and ignore it.
         image_meta.pop('id', None)
         if data:
-            image_meta['data'] = data
+	    # using fd
+	    file_size = 0
+	    fd = open(file_path, 'w')
+	    import hashlib
+	    md5 = hashlib.md5()
+	    for chunk in _read_in_chunks(data):
+		file_size = file_size + len(chunk)
+	        fd.write(chunk)
+		md5.update(chunk)
+	    fd.close()
+	    # using cp
+	    #import shutil 
+	    #shutil.copy2(data.name, filename)
+            image_meta['data'] = None
+            image_meta['size'] = file_size
+            image_meta['checksum'] = md5.hexdigest()
         try:
             image_meta = self._client.call(context, 1, 'update',
                                            image_id, **image_meta)
@@ -582,9 +604,6 @@ def _extract_attributes(image, include_locations=False):
         elif attr in include_locations_attrs:
             if include_locations:
                 output[attr] = getattr(image, attr, None)
-        # NOTE(mdorman): 'size' attribute must not be 'None', so use 0 instead
-        elif attr == 'size':
-            output[attr] = getattr(image, attr) or 0
         else:
             # NOTE(xarses): Anything that is caught with the default value
             # will result in a additional lookup to glance for said attr.
